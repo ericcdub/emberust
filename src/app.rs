@@ -80,19 +80,46 @@ impl EphEmberApp {
             rt.block_on(backend_loop(cmd_rx, update_tx, ctx));
         });
 
-        Self {
+        // Load saved credentials
+        let (username, password) = cc.storage
+            .map(|s| {
+                let u = s.get_string("username").unwrap_or_default();
+                let p = s.get_string("password").unwrap_or_default();
+                log::info!("Loaded credentials: username={}, has_password={}", 
+                    if u.is_empty() { "(empty)" } else { "(set)" },
+                    !p.is_empty());
+                (u, p)
+            })
+            .unwrap_or_else(|| {
+                log::info!("No storage available");
+                (String::new(), String::new())
+            });
+
+        let has_saved_creds = !username.is_empty() && !password.is_empty();
+
+        let app = Self {
             screen: Screen::Login,
-            username: String::new(),
-            password: String::new(),
+            username,
+            password,
             login_error: None,
-            loading: false,
+            loading: has_saved_creds,
             zones: Vec::new(),
             status_message: None,
             pending_targets: HashMap::new(),
             boost_hours: HashMap::new(),
             cmd_tx,
             update_rx,
+        };
+
+        // Auto-login if we have saved credentials
+        if has_saved_creds {
+            app.send(Command::Login {
+                username: app.username.clone(),
+                password: app.password.clone(),
+            });
         }
+
+        app
     }
 
     fn process_updates(&mut self) {
@@ -102,6 +129,13 @@ impl EphEmberApp {
                     self.screen = Screen::Dashboard;
                     self.loading = false;
                     self.login_error = None;
+                }
+                Update::LoggedOut => {
+                    self.screen = Screen::Login;
+                    self.zones.clear();
+                    self.username.clear();
+                    self.password.clear();
+                    self.loading = false;
                 }
                 Update::LoginFailed(msg) => {
                     self.loading = false;
@@ -134,7 +168,7 @@ impl EphEmberApp {
             ui.vertical_centered(|ui| {
                 ui.add_space(ui.available_height() / 4.0);
 
-                ui.heading("EPH Ember Controller");
+                ui.heading("Emberust");
                 ui.add_space(24.0);
 
                 ui.label("Email");
@@ -183,8 +217,12 @@ impl EphEmberApp {
         // Top bar
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("EPH Ember");
+                ui.heading("Emberust");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Log Out").clicked() {
+                        self.send(Command::Logout);
+                    }
+                    ui.separator();
                     if ui.add_enabled(!self.loading, egui::Button::new("Refresh")).clicked() {
                         self.loading = true;
                         self.send(Command::RefreshZones);
@@ -222,7 +260,8 @@ impl EphEmberApp {
                     .spacing([12.0, 12.0])
                     .show(ui, |ui| {
                         for (i, &idx) in zone_indices.iter().enumerate() {
-                            ui.allocate_ui(egui::vec2(card_width - 12.0, 10.0), |ui| {
+                            ui.vertical(|ui| {
+                                ui.set_width(card_width - 12.0);
                                 self.zone_card(ui, idx);
                             });
                             if (i + 1) % cols == 0 {
@@ -369,28 +408,33 @@ impl EphEmberApp {
 
                 ui.add_space(4.0);
 
-                // Boost controls
-                let zone = &self.zones[zone_idx];
-                if zone.is_boost_active() {
-                    ui.horizontal(|ui| {
+                // Boost controls - get values before the closure to avoid borrow issues
+                let boost_active = self.zones[zone_idx].is_boost_active();
+                let boost_hours_display = self.zones[zone_idx].boost_hours().unwrap_or(0);
+                
+                ui.horizontal(|ui| {
+                    ui.label("Boost:");
+                    
+                    if boost_active {
                         ui.colored_label(
                             COLOR_BOOST,
-                            format!("Boost active: {}h", zone.boost_hours().unwrap_or(0)),
+                            format!("{}h", boost_hours_display),
                         );
+                    } else {
+                        let hours = self.boost_hours.entry(zone_name.clone()).or_insert(1);
+                        ui.selectable_value(hours, 1, "1h");
+                        ui.selectable_value(hours, 2, "2h");
+                        ui.selectable_value(hours, 3, "3h");
+                    }
+                    
+                    if boost_active {
                         if ui.button("Cancel").clicked() {
                             self.send(Command::DeactivateBoost {
                                 zone_name: zone_name.clone(),
                             });
                         }
-                    });
-                } else {
-                    ui.horizontal(|ui| {
-                        ui.label("Boost:");
-                        let hours = self.boost_hours.entry(zone_name.clone()).or_insert(1);
-                        ui.selectable_value(hours, 1, "1h");
-                        ui.selectable_value(hours, 2, "2h");
-                        ui.selectable_value(hours, 3, "3h");
-                        let h = *hours;
+                    } else {
+                        let h = *self.boost_hours.get(&zone_name).unwrap_or(&1);
                         if ui.button("Activate").clicked() {
                             self.send(Command::ActivateBoost {
                                 zone_name: zone_name.clone(),
@@ -398,13 +442,74 @@ impl EphEmberApp {
                                 hours: h,
                             });
                         }
+                    }
+                    
+                    // Always show a disable button in case detection isn't working
+                    if !boost_active {
+                        if ui.small_button("Off").on_hover_text("Force disable boost").clicked() {
+                            self.send(Command::DeactivateBoost {
+                                zone_name: zone_name.clone(),
+                            });
+                        }
+                    }
+                });
+                
+                ui.add_space(8.0);
+                
+                // Debug: Show all point data - clone data to avoid borrow issues
+                let zone = &self.zones[zone_idx];
+                let product_id = zone.product_id.clone();
+                let uid = zone.uid.clone();
+                let mac = zone.mac.clone();
+                let mut points: Vec<_> = zone.point_data_list.iter()
+                    .map(|p| (p.point_index, p.value.clone()))
+                    .collect();
+                points.sort_by_key(|(idx, _)| *idx);
+                
+                egui::CollapsingHeader::new("Debug Info")
+                    .id_salt(format!("debug_{}", zone_name))
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.label(format!("productId: {}", product_id));
+                        ui.label(format!("uid: {}", uid));
+                        ui.label(format!("mac: {}", mac));
+                        ui.add_space(4.0);
+                        
+                        egui::Grid::new(format!("points_{}", zone_name))
+                            .num_columns(3)
+                            .spacing([8.0, 2.0])
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new("Idx").strong().small());
+                                ui.label(egui::RichText::new("Value").strong().small());
+                                ui.label(egui::RichText::new("Description").strong().small());
+                                ui.end_row();
+                                
+                                for (idx, val) in &points {
+                                    ui.label(format!("{}", idx));
+                                    ui.label(crate::models::format_point_value(*idx, val));
+                                    ui.label(egui::RichText::new(crate::models::point_index_description(*idx)).small());
+                                    ui.end_row();
+                                }
+                            });
                     });
-                }
             });
     }
 }
 
 impl eframe::App for EphEmberApp {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        // Persist credentials if logged in, clear if logged out
+        if self.screen == Screen::Dashboard && !self.username.is_empty() {
+            log::info!("Saving credentials for user");
+            storage.set_string("username", self.username.clone());
+            storage.set_string("password", self.password.clone());
+        } else if self.screen == Screen::Login {
+            log::info!("Clearing saved credentials");
+            storage.set_string("username", String::new());
+            storage.set_string("password", String::new());
+        }
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.process_updates();
 
@@ -443,6 +548,11 @@ async fn backend_loop(
                         send(Update::LoginFailed(e.to_string()));
                     }
                 }
+            }
+
+            Command::Logout => {
+                api = None;
+                send(Update::LoggedOut);
             }
 
             Command::RefreshZones => {

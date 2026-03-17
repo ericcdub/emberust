@@ -64,6 +64,72 @@ impl PointIndex {
     }
 }
 
+/// Get a human-readable description for a point index
+pub fn point_index_description(index: u8) -> &'static str {
+    match index {
+        3 => "Unknown (3)",
+        4 => "ADVANCE_ACTIVE (0=Off, 1=On)",
+        5 => "CURRENT_TEMP (÷10 for °C)",
+        6 => "TARGET_TEMP (÷10 for °C)",
+        7 => "MODE (0=Auto, 1=AllDay, 2=On, 3=Off)",
+        8 => "BOOST_HOURS (0=Off, 1-3=Hours)",
+        9 => "BOOST_TIME (Unix timestamp)",
+        10 => "BOILER_STATE (1=Off, 2=On)",
+        11 => "Unknown (11)",
+        13 => "Unknown (13)",
+        14 => "BOOST_TEMP (÷10 for °C)",
+        15 => "CTR_15 (counter)",
+        16 => "XXX_16 (unknown)",
+        17 => "CTR_17 (counter)",
+        18 => "CTR_18 (counter)",
+        _ => "Unknown",
+    }
+}
+
+/// Format a point value for display based on its index
+pub fn format_point_value(index: u8, value: &str) -> String {
+    if let Ok(v) = value.parse::<i64>() {
+        match index {
+            5 | 6 | 14 => format!("{} ({:.1}°C)", value, v as f32 / 10.0),
+            7 => match v {
+                0 => "0 (Auto)".to_string(),
+                1 => "1 (AllDay)".to_string(),
+                2 => "2 (On)".to_string(),
+                3 => "3 (Off)".to_string(),
+                _ => format!("{} (?)", v),
+            },
+            4 => match v {
+                0 => "0 (Off)".to_string(),
+                1 => "1 (On)".to_string(),
+                _ => format!("{} (?)", v),
+            },
+            8 => match v {
+                0 => "0 (Off)".to_string(),
+                1 => "1 (1 hour)".to_string(),
+                2 => "2 (2 hours)".to_string(),
+                3 => "3 (3 hours)".to_string(),
+                _ => format!("{} (?)", v),
+            },
+            10 => match v {
+                1 => "1 (Off)".to_string(),
+                2 => "2 (On/Heating)".to_string(),
+                _ => format!("{} (?)", v),
+            },
+            9 => {
+                // Unix timestamp - show as date/time if reasonable
+                if v > 1000000000 && v < 2000000000 {
+                    format!("{} (timestamp)", v)
+                } else {
+                    value.to_string()
+                }
+            }
+            _ => value.to_string(),
+        }
+    } else {
+        value.to_string()
+    }
+}
+
 // --- API data structures ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,7 +218,9 @@ impl Zone {
     }
 
     pub fn is_boost_active(&self) -> bool {
-        self.boost_hours().map(|h| h > 0).unwrap_or(false)
+        // Boost hours is 1-3 when active, 0 when inactive
+        // Values > 3 indicate this field means something else on this device
+        self.boost_hours().map(|h| h > 0 && h <= 3).unwrap_or(false)
     }
 
     pub fn boost_hours(&self) -> Option<u32> {
@@ -195,10 +263,7 @@ pub struct ApiResponse<T> {
 #[derive(Debug, Clone, Deserialize)]
 pub struct LoginData {
     pub token: String,
-    #[serde(rename = "refreshToken")]
     pub refresh_token: String,
-    #[serde(rename = "expiresIn")]
-    pub expires_in: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -214,6 +279,7 @@ pub enum Command {
         username: String,
         password: String,
     },
+    Logout,
     RefreshZones,
     SetTargetTemperature {
         zone_name: String,
@@ -236,6 +302,7 @@ pub enum Command {
 #[derive(Debug)]
 pub enum Update {
     LoggedIn,
+    LoggedOut,
     LoginFailed(String),
     ZonesUpdated(Vec<Zone>),
     Error(String),
@@ -249,6 +316,7 @@ pub struct MqttCredentials {
     pub client_id: String,
     pub username: String,
     pub password: String,
+    pub user_id: u64,
 }
 
 #[derive(Debug, Clone)]

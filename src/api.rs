@@ -14,7 +14,6 @@ pub struct EphEmberApi {
     refresh_token: Option<String>,
     token_expiry: Option<Instant>,
     user_id: Option<u64>,
-    gateway_id: Option<String>,
     zones: Vec<Zone>,
 }
 
@@ -31,7 +30,6 @@ impl EphEmberApi {
             refresh_token: None,
             token_expiry: None,
             user_id: None,
-            gateway_id: None,
             zones: Vec::new(),
         }
     }
@@ -54,8 +52,10 @@ impl EphEmberApi {
         let resp = self
             .client
             .post(format!("{BASE_URL}/appLogin/login"))
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
             .json(&serde_json::json!({
-                "username": self.username,
+                "userName": self.username,
                 "password": self.password,
             }))
             .send()
@@ -69,17 +69,21 @@ impl EphEmberApi {
 
         self.access_token = Some(data.token);
         self.refresh_token = Some(data.refresh_token);
-        self.token_expiry = Some(Instant::now() + Duration::from_secs(data.expires_in));
+        // Token validity is around 30 minutes based on pyephember reference
+        self.token_expiry = Some(Instant::now() + Duration::from_secs(1800));
         Ok(())
     }
 
     async fn refresh_access_token(&mut self) -> Result<()> {
-        let token = self.auth_header()?;
+        let refresh = self
+            .refresh_token
+            .clone()
+            .ok_or_else(|| anyhow!("No refresh token"))?;
 
         let resp = self
             .client
             .get(format!("{BASE_URL}/appLogin/refreshAccessToken"))
-            .header("Authorization", &token)
+            .header("Authorization", &refresh)
             .send()
             .await?
             .json::<ApiResponse<LoginData>>()
@@ -91,7 +95,7 @@ impl EphEmberApi {
 
         self.access_token = Some(data.token);
         self.refresh_token = Some(data.refresh_token);
-        self.token_expiry = Some(Instant::now() + Duration::from_secs(data.expires_in));
+        self.token_expiry = Some(Instant::now() + Duration::from_secs(1800));
         Ok(())
     }
 
@@ -130,9 +134,9 @@ impl EphEmberApi {
 
         let resp = self
             .client
-            .post(format!("{BASE_URL}/homes/list"))
+            .get(format!("{BASE_URL}/homes/list"))
             .header("Authorization", &token)
-            .json(&serde_json::json!({}))
+            .header("Accept", "application/json")
             .send()
             .await?
             .json::<ApiResponse<Vec<Home>>>()
@@ -141,38 +145,80 @@ impl EphEmberApi {
         resp.data.ok_or_else(|| anyhow!("Failed to list homes"))
     }
 
-    async fn ensure_gateway(&mut self) -> Result<String> {
-        if let Some(ref id) = self.gateway_id {
-            return Ok(id.clone());
-        }
-        let homes = self.list_homes().await?;
-        let gw = homes
-            .first()
-            .ok_or_else(|| anyhow!("No gateways found"))?
-            .gateway_id
-            .clone();
-        self.gateway_id = Some(gw.clone());
-        Ok(gw)
-    }
-
     pub async fn get_zones(&mut self) -> Result<Vec<Zone>> {
         self.ensure_auth().await?;
         let token = self.auth_header()?;
-        let gateway_id = self.ensure_gateway().await?;
+        let homes = self.list_homes().await?;
 
-        let resp = self
-            .client
-            .post(format!("{BASE_URL}/homesVT/zoneProgram"))
-            .header("Authorization", &token)
-            .json(&serde_json::json!({ "gateWayId": gateway_id }))
-            .send()
-            .await?
-            .json::<ApiResponse<Vec<Zone>>>()
-            .await?;
+        log::info!("Found {} homes/gateways", homes.len());
 
-        let zones = resp.data.ok_or_else(|| anyhow!("Failed to get zones"))?;
-        self.zones = zones.clone();
-        Ok(zones)
+        let mut all_zones = Vec::new();
+
+        // Fetch zones from all homes/gateways
+        for home in &homes {
+            log::info!("Fetching zones for gateway: {} ({})", home.name, home.gateway_id);
+            
+            // First get home details to get productId and uid
+            let details_resp = self
+                .client
+                .post(format!("{BASE_URL}/homes/detail"))
+                .header("Authorization", &token)
+                .json(&serde_json::json!({ "gateWayId": home.gateway_id }))
+                .send()
+                .await?
+                .json::<serde_json::Value>()
+                .await?;
+            
+            let product_id = details_resp["data"]["homes"]["productId"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let uid = details_resp["data"]["homes"]["uid"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            
+            log::info!("Home details: productId={}, uid={}", product_id, uid);
+            
+            // Now get zone program
+            let response = self
+                .client
+                .post(format!("{BASE_URL}/homesVT/zoneProgram"))
+                .header("Authorization", &token)
+                .json(&serde_json::json!({ "gateWayId": home.gateway_id }))
+                .send()
+                .await?;
+
+            let body = response.text().await?;
+            log::debug!("Raw response: {}", body);
+
+            let resp: ApiResponse<Vec<Zone>> = match serde_json::from_str(&body) {
+                Ok(r) => r,
+                Err(e) => {
+                    log::error!("Failed to parse zones response: {}", e);
+                    log::error!("Response body: {}", body);
+                    continue;
+                }
+            };
+
+            if let Some(mut zones) = resp.data {
+                log::info!("Gateway {} returned {} zones", home.name, zones.len());
+                // Set productId and uid from home details on each zone
+                for z in &mut zones {
+                    z.product_id = product_id.clone();
+                    z.uid = uid.clone();
+                    log::info!("  - Zone: {} (mac: {}, productId: {}, uid: {})", 
+                        z.name, z.mac, z.product_id, z.uid);
+                }
+                all_zones.extend(zones);
+            } else {
+                log::warn!("Gateway {} returned no zones data", home.name);
+            }
+        }
+
+        log::info!("Total zones found: {}", all_zones.len());
+        self.zones = all_zones.clone();
+        Ok(all_zones)
     }
 
     /// Authenticate and fetch initial zone data in one call.
@@ -183,7 +229,8 @@ impl EphEmberApi {
     }
 
     pub fn mqtt_credentials(&self) -> Option<MqttCredentials> {
-        let refresh_token = self.refresh_token.as_ref()?;
+        // MQTT uses the access token (not refresh_token) per pyephember reference
+        let token = self.access_token.as_ref()?;
         let user_id = self.user_id?;
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -192,8 +239,9 @@ impl EphEmberApi {
 
         Some(MqttCredentials {
             client_id: format!("{user_id}_{ts}"),
-            username: format!("app/{refresh_token}"),
-            password: refresh_token.clone(),
+            username: format!("app/{token}"),
+            password: token.clone(),
+            user_id,
         })
     }
 

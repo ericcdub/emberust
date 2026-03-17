@@ -34,19 +34,20 @@ pub fn encode_commands(commands: &[ZoneCommand]) -> String {
 }
 
 /// Build the JSON payload for an MQTT zone command.
-fn build_message(zone: &Zone, commands: &[ZoneCommand]) -> String {
+fn build_message(zone: &Zone, commands: &[ZoneCommand], user_id: u64) -> String {
     let point_data = encode_commands(commands);
-    let ts = SystemTime::now()
+    let ts_millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
+        .as_millis() as u64;
 
     serde_json::json!({
         "common": {
             "serial": 7870,
             "productId": zone.product_id,
             "uid": zone.uid,
-            "timestamp": ts.to_string(),
+            "timestamp": ts_millis.to_string(),
+            "userId": user_id.to_string(),
         },
         "data": {
             "mac": zone.mac,
@@ -62,6 +63,10 @@ pub async fn send_zone_commands(
     zone: &Zone,
     commands: &[ZoneCommand],
 ) -> Result<()> {
+    log::info!("MQTT: Connecting to {}:{}", MQTT_HOST, MQTT_PORT);
+    log::info!("MQTT: client_id={}", creds.client_id);
+    log::info!("MQTT: username={}", &creds.username[..creds.username.len().min(20)]);
+    
     let mut options = MqttOptions::new(&creds.client_id, MQTT_HOST, MQTT_PORT);
     options.set_credentials(&creds.username, &creds.password);
     options.set_keep_alive(Duration::from_secs(60));
@@ -69,39 +74,78 @@ pub async fn send_zone_commands(
 
     let (client, mut eventloop) = AsyncClient::new(options, 10);
 
-    // Drive the event loop to establish the connection
-    eventloop.poll().await.map_err(|e| anyhow!("MQTT connect: {e}"))?;
+    // Drive the event loop until we're connected
+    let mut connected = false;
+    for _ in 0..10 {
+        match eventloop.poll().await {
+            Ok(rumqttc::Event::Incoming(rumqttc::Packet::ConnAck(ack))) => {
+                log::info!("MQTT: Connected! code={:?}", ack.code);
+                if ack.code == rumqttc::ConnectReturnCode::Success {
+                    connected = true;
+                    break;
+                } else {
+                    return Err(anyhow!("MQTT connection refused: {:?}", ack.code));
+                }
+            }
+            Ok(event) => {
+                log::debug!("MQTT: event during connect: {:?}", event);
+            }
+            Err(e) => {
+                return Err(anyhow!("MQTT connect error: {e}"));
+            }
+        }
+    }
+    
+    if !connected {
+        return Err(anyhow!("MQTT: Failed to receive ConnAck"));
+    }
 
     let topic = format!("{}/{}/download/pointdata", zone.product_id, zone.uid);
-    let payload = build_message(zone, commands);
+    let payload = build_message(zone, commands, creds.user_id);
+    
+    log::info!("MQTT: Publishing to topic: {}", topic);
+    log::debug!("MQTT: Payload: {}", payload);
 
     client
         .publish(&topic, QoS::AtLeastOnce, false, payload.as_bytes())
         .await
         .map_err(|e| anyhow!("MQTT publish: {e}"))?;
 
-    // Poll until the publish is acknowledged (or timeout)
+    // Poll until the publish is acknowledged
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut published = false;
     loop {
         let poll = tokio::time::timeout_at(deadline, eventloop.poll()).await;
         match poll {
-            Ok(Ok(_event)) => {
-                // Check if we've been connected long enough for the ack
-                // For simplicity, do a few polls then break
+            Ok(Ok(rumqttc::Event::Incoming(rumqttc::Packet::PubAck(_)))) => {
+                log::info!("MQTT: Publish acknowledged");
+                published = true;
+                break;
+            }
+            Ok(Ok(event)) => {
+                log::debug!("MQTT: event: {:?}", event);
             }
             Ok(Err(e)) => {
                 log::warn!("MQTT poll error: {e}");
                 break;
             }
-            Err(_) => break, // timeout
+            Err(_) => {
+                log::warn!("MQTT: Timeout waiting for PubAck");
+                break;
+            }
         }
-        // Give it a moment then break - the publish should be sent
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        break;
     }
 
     client.disconnect().await.ok();
-    Ok(())
+    
+    if published {
+        log::info!("MQTT: Command sent successfully");
+        Ok(())
+    } else {
+        // Even if we didn't get a PubAck, the message may have been sent
+        log::warn!("MQTT: No PubAck received, but message may have been sent");
+        Ok(())
+    }
 }
 
 /// Build commands for setting target temperature.

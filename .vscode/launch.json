@@ -1,0 +1,80 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "cppvsdbg",
+            "request": "launch",
+            "name": "Debug emberust (MSVC)",
+            "program": "${workspaceFolder}/target/debug/emberust.exe",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "cargo build",
+            "console": "integratedTerminal"
+        },
+        {
+            "type": "cppvsdbg",
+            "request": "launch",
+            "name": "Debug emberust release (MSVC)",
+            "program": "${workspaceFolder}/target/release/emberust.exe",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "cargo build --release",
+            "console": "integratedTerminal"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug emberust (LLDB)",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=emberust",
+                    "--package=emberust"
+                ],
+                "filter": {
+                    "name": "emberust",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug emberust release (LLDB)",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--release",
+                    "--bin=emberust",
+                    "--package=emberust"
+                ],
+                "filter": {
+                    "name": "emberust",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug unit tests (LLDB)",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--no-run",
+                    "--package=emberust"
+                ],
+                "filter": {
+                    "name": "emberust",
+                    "kind": "lib"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}

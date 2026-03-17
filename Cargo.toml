@@ -1,12 +1,12 @@
 [package]
-name = "eph-ember"
+name = "emberust"
 version = "0.1.0"
 edition = "2021"
-description = "EPH Ember heating system controller"
+description = "Emberust - EPH Ember heating system controller"
 
 [dependencies]
 # GUI - eframe/egui supports desktop + Android
-eframe = "0.29"
+eframe = { version = "0.29", features = ["persistence"] }
 
 # HTTP client - rustls for cross-platform (Android-ready)
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
