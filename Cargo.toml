@@ -1,0 +1,28 @@
+[package]
+name = "eph-ember"
+version = "0.1.0"
+edition = "2021"
+description = "EPH Ember heating system controller"
+
+[dependencies]
+# GUI - eframe/egui supports desktop + Android
+eframe = "0.29"
+
+# HTTP client - rustls for cross-platform (Android-ready)
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# MQTT client
+rumqttc = "0.24"
+
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Utilities
+anyhow = "1"
+base64 = "0.22"
+log = "0.4"
+env_logger = "0.11"
